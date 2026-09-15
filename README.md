@@ -1,7 +1,7 @@
 # headroom-metrics
 
 Dashboard locale (solo stdlib, zero dipendenze) che mostra consumi Headroom / OpenCode Go,
-proiezioni a 5 scenari fino al reset quota e forecast giorno/mese per-modello a prezzi reali.
+proiezione Standard fino al reset quota e forecast giorno/mese/anno a prezzi reali.
 
 - **Vive su** `http://127.0.0.1:8790/` (il proxy Headroom resta su `:8787`)
 - **Sorgente primaria**: `GET http://127.0.0.1:8787/stats-history` (serie storiche + totali in una chiamata)
@@ -59,18 +59,29 @@ Stesso triple corretto in `~/.headroom/config/models.json` (+ mirror `HEADROOM_M
 in `~/.bashrc:161`); backup `models.json.2026-09-15-1437.bak`; rollback in `RUNBOOK.md` §3.
 Le % del sito sono sul workspace $60 — la dashboard resta allineata al sito.
 
+## Proiezione Standard (trend su tutto lo storico)
+
+Unico scenario `STD`: fit ai minimi quadrati su TUTTI i `series.daily` (nessun cap 14gg;
+il cap resta solo per le righe mostrate in tabella), ricalcolato live a ogni request.
+`forecast(d)=max(trend_today+m*d,0)` con `trend_today` = valore trend oggi e `m` = pendenza
+token/giorno; giornaliera = forecast(0), mensile = cumulato mese + somma trend sui giorni
+rimanenti (`calendar.monthrange`), annuale = somma 365g da oggi. Fallback media: se `days_observed<7`
+o pendenza negativa, `forecast(d)=mean_all` con `note:"fallback media: storico corto o pendenza negativa"`
+(pendenza riportata comunque as-is). Costi al rate pesato
+`weighted_rate_usd_per_token()` sul mix lifetime. A storico assente: zeri + `note:"storico assente"`.
+
 ## Endpoint dashboard
 
 | Endpoint | Risposta |
 |---|---|
 | `/` | pagina HTML (template `dashboard.html`, hot-reload a ogni modifica) |
-| `/refresh`, `/api/stats` | JSON: `lifetime`, `quota{used,total,pct,left,days_left,reset}`, `quota_models[]`, `scenarios[5]`, `daily[≤14]`, `monthly{cumulato+stima}`, `profiles`, `horizon` |
+| `/refresh`, `/api/stats` | JSON: `lifetime`, `quota{used,total,pct,left,days_left,reset}`, `quota_models[]`, `scenarios[1 STD]`, `projection{days_observed,mean_daily_tokens,slope,daily,monthly,annual,models}`, `daily[≤14]`, `monthly{cumulato+stima}`, `profiles`, `horizon` |
 | `/health` | `ok` |
 
 ## Layout repo
 
 ```
-headroom_dashboard.py   server + analisi + scenari (stdlib only)
+headroom_dashboard.py   server + analisi + scenario Standard (stdlib only)
 dashboard.html          template (placeholder @@PAYLOAD@@ / @@QUOTA@@)
 exports/                quota-models.json (snapshot quota) + export JSON opzionali
 RUNBOOK.md              comandi operativi, rollback pricing, boot note

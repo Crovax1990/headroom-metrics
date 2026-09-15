@@ -334,7 +334,84 @@ def load_quota(fallback_used: float):
     return used, total, reset, models
 
 
-# ----------------------------- analisi + scenari -----------------------------
+# ----------------------------- proiezione standard (trend su tutto lo storico) -----------------------------
+def _linreg(deltas: list) -> tuple:
+    """Minimi quadrati su (indice, delta). Ritorna (slope, intercept)."""
+    n = len(deltas)
+    if n < 2:
+        return 0.0, (float(deltas[0]) if n == 1 else 0.0)
+    sx = n * (n - 1) / 2.0
+    sxx = (n - 1) * n * (2 * n - 1) / 6.0
+    sy = sum(deltas)
+    sxy = sum(i * v for i, v in enumerate(deltas))
+    denom = n * sxx - sx * sx
+    m = (n * sxy - sx * sy) / denom if denom else 0.0
+    return m, (sy - m * sx) / n
+
+
+def _forecast_rule(deltas: list) -> tuple:
+    """Regola unica trend/fallback condivisa da projection e scenario STD.
+    Ritorna (forecast, mean_all, slope, trend_today, n, note)."""
+    n = len(deltas)
+    if n == 0:
+        return (lambda d: 0.0), 0.0, 0.0, 0.0, 0, "storico assente"
+    if n == 1:
+        m, trend_today, mean_all = 0.0, float(deltas[0]), float(deltas[0])
+    else:
+        m, b = _linreg(deltas)
+        trend_today = b + m * (n - 1)
+        mean_all = sum(deltas) / n
+    if n < 7 or m < 0:
+        return (lambda d, _v=max(mean_all, 0.0): _v), mean_all, m, trend_today, n, \
+            "fallback media: storico corto o pendenza negativa"
+    return (lambda d, _m=m, _t=trend_today: max(_t + _m * d, 0.0)), mean_all, m, trend_today, n, ""
+
+
+def build_projection(daily_full: list, monthly: dict, rate: float, ex: dict) -> dict:
+    """Trend lineare su TUTTO lo storico (nessun cap 14gg). Ricalcolato a ogni chiamata.
+    daily_full: [(date, delta)] ordinati; monthly: dict da build_monthly(); rate: $/token pesato."""
+    deltas = [float(v) for _, v in daily_full]
+    n = len(deltas)
+    lt = (ex or {}).get("lifetime", {})
+    bm = (ex or {}).get("by_model") or {}
+    inp_total = lt.get("total_input_tokens", 0) or sum(
+        (m.get("total_input_tokens", 0) for m in bm.values()), 0)
+    models = []
+    for model, m in bm.items():
+        tok = m.get("total_input_tokens", 0) or 0
+        if tok > 0 and inp_total:
+            models.append({"model": model, "pct": tok / inp_total * 100})
+    models.sort(key=lambda r: r["pct"], reverse=True)
+    if n == 0:
+        zero = {"tokens": 0.0, "cost_usd": 0.0}
+        return {"days_observed": 0, "mean_daily_tokens": 0.0, "slope_tokens_per_day": 0.0,
+                "daily": dict(zero), "monthly": dict(zero), "annual": dict(zero),
+                "models": models, "note": "storico assente"}
+    forecast, mean_all, m, trend_today, n, note = _forecast_rule(deltas)
+
+    daily_tok = forecast(0)
+    remaining = monthly.get("days_remaining", 0) if monthly else 0
+    fut_month = sum(forecast(d) for d in range(max(remaining, 0)))
+    cum_tok = (monthly or {}).get("cumulative_tokens", 0) or 0
+    cum_cost = (monthly or {}).get("cumulative_cost_usd", 0) or 0.0
+    fut_year = sum(forecast(d) for d in range(365))
+    monthly_tok, monthly_cost = cum_tok + fut_month, cum_cost + fut_month * rate
+    annual_tok, annual_cost = fut_year, fut_year * rate
+    if annual_tok < monthly_tok:
+        annual_tok, annual_cost = monthly_tok, monthly_cost
+    return {
+        "days_observed": n,
+        "mean_daily_tokens": mean_all,
+        "slope_tokens_per_day": m,
+        "daily": {"tokens": daily_tok, "cost_usd": daily_tok * rate},
+        "monthly": {"tokens": monthly_tok, "cost_usd": monthly_cost},
+        "annual": {"tokens": annual_tok, "cost_usd": annual_cost},
+        "models": models,
+        "note": note,
+    }
+
+
+# ----------------------------- analisi + scenario standard -----------------------------
 def analyze() -> dict:
     exs = load_exports()
     now = datetime.now()
@@ -361,28 +438,24 @@ def analyze() -> dict:
     marathon = mean(mara_v) if mara_v else CFG["DEFAULT_MARATHON"]
     recent = mean([v for _, v in daily[-4:]]) if daily else CFG["DEFAULT_RECENT"]
 
-    scenarios = [
-        ("S1", "Ritmo recenti (media ultimi 4g, tutti i giorni)", {d: recent for d in range(7)}, f"{recent/1e6:.0f}M/giorno"),
-        ("S2", "Weekend osservato (ven+sab leggere, dom maratona)", {4: light, 5: light, 6: marathon}, f"ven/sab {light/1e6:.0f}M, dom {marathon/1e6:.0f}M"),
-        ("S3", "Weekend controllato (maratona dimezzata)", {4: light, 5: light, 6: marathon / 2}, f"ven/sab {light/1e6:.0f}M, dom {marathon/2e6:.0f}M"),
-        ("S4", "Leggere sparse (lun, mer, ven, sab)", {0: light, 2: light, 4: light, 5: light}, f"4 sessioni {light/1e6:.0f}M/sett."),
-        ("S5", "Solo weekend leggero (ven, sab)", {4: light, 5: light}, f"2 sessioni {light/1e6:.0f}M/sett."),
-    ]
-    rows = []
-    for sid, name, pattern, desc in scenarios:
-        tot_tok, cum, exhaust = 0.0, cost, None
-        for i in range(horizon):
-            d = today + timedelta(days=i)
-            tk = pattern.get(d.weekday(), 0)
-            tot_tok += tk
-            cum += tk * rate
-            if exhaust is None and cum >= CFG["QUOTA_USD"]:
-                exhaust = d.isoformat()
-        pct = cum / CFG["QUOTA_USD"] * 100
-        verdict, cls = ("OK", "ok") if pct <= 85 else (("ATTENZIONE", "warn") if pct <= 100 else ("SFORAMENTO", "over"))
-        rows.append({"id": sid, "name": name, "desc": desc, "tokens": tot_tok,
-                     "cost": cum - cost, "total": cum, "pct": pct,
-                     "exhaust": exhaust or "", "verdict": verdict, "cls": cls})
+    projection = build_projection(daily, monthly, rate, ex)
+    ftok = projection["daily"]["tokens"]
+    desc = (f"trend su {projection['days_observed']}g · "
+            f"{ftok/1e6:.0f}M/giorno · slope {projection['slope_tokens_per_day']/1e6:+.1f}M/g"
+            + (f" · {projection['note']}" if projection.get('note') else ""))
+    fcast, _, _, _, _, _ = _forecast_rule([float(v) for _, v in daily])
+    tot_tok, cum, exhaust = 0.0, cost, None
+    for i in range(horizon):
+        tk = fcast(i)
+        tot_tok += tk
+        cum += tk * rate
+        if exhaust is None and cum >= CFG["QUOTA_USD"]:
+            exhaust = (today + timedelta(days=i)).isoformat()
+    pct = cum / CFG["QUOTA_USD"] * 100
+    verdict, cls = ("OK", "ok") if pct <= 85 else (("ATTENZIONE", "warn") if pct <= 100 else ("SFORAMENTO", "over"))
+    rows = [{"id": "STD", "name": "Standard (trend su tutto lo storico)", "desc": desc,
+             "tokens": tot_tok, "cost": cum - cost, "total": cum, "pct": pct,
+             "exhaust": exhaust or "", "verdict": verdict, "cls": cls}]
     return {
         "updated_at": now.isoformat(timespec="seconds"),
         "generated_at": ex.get("generated_at", "-"),
@@ -393,7 +466,7 @@ def analyze() -> dict:
                   "reset": q_reset},
         "quota_models": q_models_pct,
         "profiles": {"light": light, "marathon": marathon, "recent": recent},
-        "horizon": horizon, "scenarios": rows,
+        "horizon": horizon, "scenarios": rows, "projection": projection,
         "daily_last": [{"d": str(d), "tok": v} for d, v in daily[-7:]],
         "daily": daily_rows,
         "monthly": monthly,
@@ -411,6 +484,12 @@ def load_payload() -> dict:
             horizon = CFG["HORIZON_OVERRIDE"] or max((CFG["RESET_DATE"] - date.today()).days, 1)
             return {"error": str(e), "updated_at": datetime.now().isoformat(timespec="seconds"),
                     "generated_at": "-", "scenarios": [],
+                    "projection": {"days_observed": 0, "mean_daily_tokens": 0.0,
+                                   "slope_tokens_per_day": 0.0,
+                                   "daily": {"tokens": 0.0, "cost_usd": 0.0},
+                                   "monthly": {"tokens": 0.0, "cost_usd": 0.0},
+                                   "annual": {"tokens": 0.0, "cost_usd": 0.0},
+                                   "models": [], "note": "storico assente"},
                     "lifetime": {"input": 0, "cache_read": 0, "cache_pct": 0, "real_cost": 0},
                     "quota": {"total": CFG["QUOTA_USD"], "used": 0, "pct": 0, "left": CFG["QUOTA_USD"],
                               "days_left": horizon, "reset": str(CFG["RESET_DATE"])},

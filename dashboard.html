@@ -35,7 +35,14 @@ footer{padding:10px 20px 24px;color:var(--mu);font-size:11px}
 <div class="card"><h3>Giorni al reset</h3><p id="dleft"></p><small id="reset"></small></div>
 <div class="card"><h3>Profili osservati</h3><p id="obs" style="font-size:12px"></p></div>
 </section>
-<h2>Proiezione a <span id="hor"></span> giorni — 5 scenari</h2>
+<h2>Proiezione Standard — trend su tutto lo storico</h2>
+<section class="cards">
+<div class="card"><h3>Giornaliera</h3><p id="std_d"></p><small id="std_dn"></small></div>
+<div class="card"><h3>Mensile</h3><p id="std_m"></p><small id="std_mn"></small></div>
+<div class="card"><h3>Annuale</h3><p id="std_a"></p><small id="std_an"></small></div>
+</section>
+<p style="margin:0 20px 14px;color:var(--mu);font-size:11.5px" id="std_method"></p>
+<h2>Scenario Standard a <span id="hor"></span> giorni</h2>
 <table><thead><tr><th>#</th><th>Scenario</th><th>Profilo</th><th>Token prog.</th><th>Costo prog.</th><th>Totale finestra</th><th>% quota</th><th>Esaurimento</th><th>Esito</th></tr></thead>
 <tbody id="tb"></tbody></table>
 <h2>Spesa giornaliera per modello (daily, ultimi <span id="dcount"></span> giorni)</h2>
@@ -50,6 +57,7 @@ footer{padding:10px 20px 24px;color:var(--mu);font-size:11px}
 Giornaliero: costo per-modello = input-delta × prezzo miss; cache non scomposta nel daily → approssimazione input-only; timestamp serie in UTC (Z), ore mostrate locali.
 Mensile: stima = cumulato + media_daily × giorni_rimanenti_mese (media su ultimi min(disponibili,14) giorni); anche qui limite input-only per la cache.
 Quota OpenCode Go: @@QUOTA@@ USD.
+ Proiezione Standard: trend lineare su tutto lo storico (N giorni), ricalcolato a ogni refresh — forecast(d)=max(trend_today+m*d,0); fallback media (forecast(d)=media) se N&lt;7 o pendenza negativa; annuale = somma 365g da oggi; pendenza m in token/giorno dal fit ai minimi quadrati.
 Quota usata e split per-modello: snapshot manuale (exports/quota-models.json) — nessuna API pubblica OpenCode (auth wall), aggiornare il file per refresh.</footer>
 <script>
 const PAYLOAD=@@PAYLOAD@@;
@@ -68,7 +76,18 @@ function apply(p){
  $('dleft').textContent=p.quota.days_left||0;
  $('reset').textContent='reset '+p.quota.reset;
  $('obs').innerHTML='leggera '+M(p.profiles.light)+' · maratona '+M(p.profiles.marathon)+' · media recenti 4g '+M(p.profiles.recent);
- $('hor').textContent=p.horizon||0;
+  $('hor').textContent=p.horizon||0;
+  const pr=p.projection||{};
+  const dd=(pr.daily||{}),mm=(pr.monthly||{}),aa=(pr.annual||{});
+  $('std_d').textContent=M(dd.tokens||0)+' · '+USD(dd.cost_usd||0);
+  $('std_m').textContent=M(mm.tokens||0)+' · '+USD(mm.cost_usd||0);
+  $('std_a').textContent=M(aa.tokens||0)+' · '+USD(aa.cost_usd||0);
+  const pm=((pr.models||[]).map(r=>`${r.model} ${(+r.pct).toFixed(1)}%`).join(' · ')||'—');
+  $('std_dn').textContent='token/giorno stimati · mix: '+pm;
+  $('std_mn').textContent='cumulato mese + trend sui gg rimanenti';
+  $('std_an').textContent='somma trend 365g da oggi';
+  const sl=((pr.slope_tokens_per_day||0)/1e6);
+  $('std_method').textContent=`trend lineare su ${pr.days_observed||0} giorni di storico, ricalcolato a ogni refresh · media ${(M(pr.mean_daily_tokens||0))}/g · pendenza ${sl>=0?'+':''}${sl.toFixed(1)}M/g${pr.note?' · '+pr.note:''}`;
  $('upd').textContent='aggiornato '+p.updated_at;
   $('tb').innerHTML=(p.scenarios||[]).map(s=>`<tr><td>${s.id}</td><td><b>${s.name}</b></td><td>${s.desc}</td>
   <td>${M(s.tokens)}</td><td>${USD(s.cost)}</td><td>${USD(s.total)}</td>
