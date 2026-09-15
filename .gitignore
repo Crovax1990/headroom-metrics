@@ -4,3 +4,4 @@ __pycache__/
 *.log
 metrics.log
 /tmp/
+.omo/run-continuation/
