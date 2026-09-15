@@ -1,0 +1,9 @@
+[project]
+name = "headroom-metrics"
+version = "0.2.0"
+description = "Dashboard locale di proiezione consumi Headroom / OpenCode Go"
+requires-python = ">=3.12"
+dependencies = []   # solo stdlib: http.server, json, glob, urllib
+
+[tool.uv]
+package = false     # uv run esegue lo script senza buildare/installare il progetto
